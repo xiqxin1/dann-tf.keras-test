@@ -3,14 +3,14 @@ import tensorflow as tf
 # tf.compat.v1.enable_eager_execution()
 print(tf.__version__)
 from tensorflow.keras.layers import Input, Dense, Dropout, Activation, Flatten, \
-    Conv1D, BatchNormalization, MaxPooling1D, UpSampling1D
+    Conv1D, BatchNormalization, MaxPooling1D, UpSampling1D, LSTM
 from tensorflow.python.keras.layers import Cropping1D
 from tensorflow.keras.models import Model
 from tensorflow.python.framework import ops
 from tensorflow.keras.preprocessing import sequence
 # I'm not sure of this import, most people import "Layer" just from Keras
-from tensorflow.python.keras.engine.base_layer import Layer
-
+# from tensorflow.python.keras.engine.base_layer import Layer
+from tensorflow.python.keras.utils.np_utils import to_categorical
 import numpy as np
 import pandas as pd
 import re
@@ -32,6 +32,10 @@ def autoencoder_model(timesteps, input_dim):
     x = Conv1D(16, kernelsize, activation=activation, padding='same', use_bias=True)(inputs)
     x = BatchNormalization(axis=-1)(x)
     x = MaxPooling1D(maxpoolsize, padding='same')(x)
+    x = Conv1D(8, kernelsize, activation=activation, padding='same', use_bias=True,
+               input_shape=(timesteps, input_dim))(x)
+    x = BatchNormalization(axis=-1)(x)
+    x = MaxPooling1D(maxpoolsize, padding='same')(x)
     x = Conv1D(latent_dim, kernelsize, activation=activation_last, padding='same', use_bias=True,
                input_shape=(timesteps, input_dim))(x)
     x = BatchNormalization(axis=-1)(x)
@@ -41,8 +45,13 @@ def autoencoder_model(timesteps, input_dim):
                input_shape=(timesteps, input_dim))(encoded)
     x = BatchNormalization(axis=-1)(x)
     x = UpSampling1D(maxpoolsize)(x)
-    x = Conv1D(16, kernelsize, activation=activation, padding='same', use_bias=True,
+    x = Conv1D(8, kernelsize, activation=activation, padding='same', use_bias=True,
                input_shape=(timesteps, input_dim))(x)
+    x = BatchNormalization(axis=-1)(x)
+    x = UpSampling1D(maxpoolsize)(x)
+    x = Conv1D(16, kernelsize, activation=activation, padding='same', use_bias=True,
+               input_shape=(timesteps, input_dim))(
+        x)
     x = BatchNormalization(axis=-1)(x)
     x = UpSampling1D(maxpoolsize)(x)
     n_crop = int(x.shape[1] - timesteps)
@@ -59,7 +68,8 @@ def autoencoder_model(timesteps, input_dim):
     return autoencoder, encoder
 
 def domain_model(encoder):
-    flip_layer = GradientReversal(hp_lambda=1)
+    lambdal=0.999
+    flip_layer = GradientReversalLayer(lambdal)
     dann_in = flip_layer(encoder.output)
     domain_classifier = Flatten(name="do4")(dann_in)
     domain_classifier = BatchNormalization(name="do5")(domain_classifier)
@@ -72,61 +82,23 @@ def domain_model(encoder):
     return domain_classification_model
 
 @tf.custom_gradient
-def reverse_gradient(X, hp_lambda):
-    """Flips the sign of the incoming gradient during training."""
-    try:
-        reverse_gradient.num_calls += 1
-    except AttributeError:
-        reverse_gradient.num_calls = 1
+def GradientReversalOperator(x,lambdal):
+    def grad(dy):
+        return lambdal * tf.negative(dy)
+    return x, grad
 
-    grad_name = "GradientReversal%d" % reverse_gradient.num_calls
+class GradientReversalLayer(tf.keras.layers.Layer):
+    def __init__(self, lambdal):
+        super(GradientReversalLayer, self).__init__()
+        self.lambdal = lambdal
 
-    @ops.RegisterGradient(grad_name)
-    def _flip_gradients(grad):
-        return [tf.negative(grad) * hp_lambda]
-    #
-    # def grad(dy):
-    #     return tf.constant(0.0)
-    # return tf.negative(X), grad
-
-    # g = K.get_session().graph
-    with tf.Graph().as_default() as g:
-        with g.gradient_override_map({'Identity': grad_name}):
-            y = tf.identity(X)
-    # y = tf.identity(X)
-    return y
-
-
-class GradientReversal(Layer):
-    """Layer that flips the sign of gradient during training."""
-
-    def __init__(self, hp_lambda, **kwargs):
-        super(GradientReversal, self).__init__(**kwargs)
-        self.supports_masking = True
-        self.hp_lambda = hp_lambda
-
-    # @staticmethod
-    def get_output_shape_for(input_shape):
-        return input_shape
-
-    def build(self, input_shape):
-        # self.trainable_weights = []
-        return
-
-    def call(self, x, mask=None):
-        return reverse_gradient(x, self.hp_lambda)
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
-
-    def get_config(self):
-        config = {}
-        base_config = super(GradientReversal, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
-
+    def call(self, inputs):
+        return GradientReversalOperator(inputs, self.lambdal)
 
 class ATTMODEL:
     def __init__(self, timesteps, input_dim):
+        super(ATTMODEL, self).__init__()
+
         self.timesteps = timesteps
         self.input_dim = input_dim
         self.autoencoder = self.encoder = self.domain_classification_model = self.comb_model = None
@@ -140,13 +112,14 @@ class ATTMODEL:
         self.domain_classification_model = domain_model(self.encoder)
         self.domain_classification_model.compile(optimizer="Adam",
                                                  loss=['binary_crossentropy'], metrics=['accuracy'])
-
+        self.domain_classification_model.summary()
+        # self.domain_classification_model.metrics_names
         self.autoencoder.compile(optimizer='Adam', loss='mse', metrics=['accuracy'])
 
         self.comb_model = Model(inputs=self.autoencoder.input,
                                 outputs=[self.autoencoder.output, self.domain_classification_model.output])
         self.comb_model.compile(optimizer="Adam",
-                                loss=['mse', 'binary_crossentropy'], loss_weights=[1, 200], metrics=['accuracy'], )
+                                loss=['mse', 'binary_crossentropy'], loss_weights=[1, 1], metrics=['accuracy'], )
 
         print('Finished initializing model structure......')
         return
@@ -222,7 +195,8 @@ def hotvec(dim, label, num):
     ret = []
     for i in range(num):
         vec = [0] * dim
-        vec[label] = 1
+        vec[0] = label
+        # vec[label] = 1
         ret.append(vec)
     return np.array(ret)
 
@@ -240,16 +214,37 @@ X_normal_train = sequence.pad_sequences(normal_data, maxlen=maxlen, dtype='float
                                         truncating='post', value=-1.0)
 X_mutant_train = sequence.pad_sequences(mutant_data, maxlen=maxlen, dtype='float64', padding='post',
                                             truncating='post', value=-1.0)
-Y_normal = hotvec(2, 0, len(normal_data)).reshape([-1, 2])
-Y_mutant = hotvec(2, 1, len(mutant_data)).reshape([-1, 2])
+Y_normal = hotvec(1, 0, len(normal_data)).reshape([-1, 1])
+Y_mutant = hotvec(1, 1, len(mutant_data)).reshape([-1, 1])
 
 X_train = np.concatenate((X_normal_train, X_mutant_train))
 Y_train = np.concatenate((Y_normal, Y_mutant))
+
+import numpy.random as rnd
+
+# index_X_adv = rnd.choice([idx for idx in range(0, len(X_train))], len(X_train), replace=False)
+# X_adv_rnd = X_train[index_X_adv]
+# # y_adversarial = Y_train[index_X_adv]
+X_adv_rnd = X_train
+y_adversarial = to_categorical(Y_train)
+y_adversarial = tf.cast(y_adversarial, tf.float32)
 
 timesteps = maxlen
 input_dim = np.array(X_train).shape[2]
 dtc = ATTMODEL(timesteps=timesteps, input_dim=input_dim)
 dtc.initialize()
-for epoch in range(300):
+results = []
+loss = tf.keras.losses.SparseCategoricalCrossentropy()
+for epoch in range(500):
     print('run epoch:' + str(epoch))
-    stats = dtc.comb_model.train_on_batch(X_train, [X_train, Y_train])
+    stats = dtc.comb_model.train_on_batch(X_train, [X_train, y_adversarial])
+    # stats = dtc.domain_classification_model.train_on_batch(X_train,  y_adversarial)
+    print(stats)
+    results.append(stats)
+
+aa = np.array(results)
+import matplotlib.pyplot as plt
+plt.plot(aa[:,0],'r')
+plt.plot(aa[:,1],'b')
+plt.show()
+plt.close()
